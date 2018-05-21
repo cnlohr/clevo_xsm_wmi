@@ -43,9 +43,9 @@
 
 #define __CLEVO_XSM_PR(lvl, fmt, ...) do { pr_##lvl(fmt, ##__VA_ARGS__); } \
 		while (0)
-#define CLEVO_XSM_INFO(fmt, ...)  __CLEVO_XSM_PR(err, fmt, ##__VA_ARGS__)
+#define CLEVO_XSM_INFO(fmt, ...)  __CLEVO_XSM_PR(info, fmt, ##__VA_ARGS__)
 #define CLEVO_XSM_ERROR(fmt, ...) __CLEVO_XSM_PR(err, fmt, ##__VA_ARGS__)
-#define CLEVO_XSM_DEBUG(fmt, ...) __CLEVO_XSM_PR(err, "[%s:%u] " fmt, \
+#define CLEVO_XSM_DEBUG(fmt, ...) __CLEVO_XSM_PR(debug, "[%s:%u] " fmt, \
 		__func__, __LINE__, ##__VA_ARGS__)
 
 #define CLEVO_EVENT_GUID  "ABBC0F6B-8EA1-11D1-00A0-C90629100000"
@@ -134,7 +134,7 @@ static int param_set_kb_brightness(const char *val,
 	const struct kernel_param *kp)
 {
 	int ret;
-	printk( "Brightness: %s\n", val );
+
 	ret = param_set_byte(val, kp);
 
 	if (!ret && *((unsigned char *) kp->arg) > KB_BRIGHTNESS_MAX)
@@ -308,7 +308,7 @@ static int clevo_xsm_input_polling_thread(void *data)
 {
 	unsigned int report_cnt = 0;
 
-	CLEVO_XSM_INFO("Polling thread started (PID: %i), p0lling at %i Hz\n",
+	CLEVO_XSM_INFO("Polling thread started (PID: %i), polling at %i Hz\n",
 				current->pid, param_poll_freq);
 
 	while (!kthread_should_stop()) {
@@ -476,12 +476,7 @@ static struct {
 		unsigned extra;
 	} color;
 
-	struct {
-		unsigned left;
-		unsigned center;
-		unsigned right;
-		unsigned extra;
-	} rgbcolor;
+    u32 rgbcolor[4];
 
 	unsigned brightness;
 
@@ -502,8 +497,7 @@ static struct {
 			unsigned right, unsigned extra);
 		void (*set_brightness)(unsigned brightness);
 		void (*set_mode)(enum kb_mode);
-		void (*set_rgb)(unsigned left, unsigned center,
-			unsigned right, unsigned extra);
+		void (*set_rgb)(unsigned * colors);
 		void (*init)(void);
 	} *ops;
 
@@ -596,27 +590,20 @@ static void kb_next_color(void)
 }
 
 /* Full RGB backlight */
-static void kb_full_color__set_rgb( unsigned left, unsigned center, unsigned right, unsigned extra )
+static void kb_full_color__set_rgb( unsigned * colors )
 {
 	u32 cmd;
-printk( "FULL COLOR: %02x\n", left );
-	cmd = 0xF0000000 | (left&0xffffff);
-	if (!clevo_xsm_wmi_evaluate_wmbb_method(SET_KB_LED, cmd, NULL))
-		kb_backlight.color.left = left;
-
-	cmd = 0xF1000000 | (center&0xffffff);
-	if (!clevo_xsm_wmi_evaluate_wmbb_method(SET_KB_LED, cmd, NULL))
-		kb_backlight.color.center = center;
-
-	cmd = 0xF2000000 | (right&0xffffff);
-	if (!clevo_xsm_wmi_evaluate_wmbb_method(SET_KB_LED, cmd, NULL))
-		kb_backlight.color.right = right;
-
-	if (kb_backlight.extra == KB_HAS_EXTRA_TRUE) {
-		cmd = 0xF3000000 | (extra &0xffffff);
-		if(!clevo_xsm_wmi_evaluate_wmbb_method(SET_KB_LED, cmd, NULL))
-			kb_backlight.color.extra = extra;
-	}
+    const u32 codes[4] = { 0xF0000000, 0xF1000000, 0xF2000000, 0xF3000000 };
+    int i = 0;
+    int cols = (kb_backlight.extra == KB_HAS_EXTRA_TRUE)?4:3;
+    for( i = 0; i < cols; i++ )
+    {
+        u32 color = colors[i];
+        u32 cset = (color & 0xff0000)|((color&0xff)<<8)|((color&0xff00)>>8);
+    	cmd = codes[i] | cset;
+    	if (!clevo_xsm_wmi_evaluate_wmbb_method(SET_KB_LED, cmd, NULL))
+            kb_backlight.rgbcolor[i] = color;
+    }
 
 	kb_backlight.mode = KB_MODE_CUSTOM;
 }
@@ -1198,7 +1185,6 @@ static ssize_t clevo_xsm_mode_store(struct device *child,
 	unsigned int val;
 	int ret;
 
-    CLEVO_XSM_ERROR( "!!! %d %s\n", kb_backlight.ops, buf );
 	if (!kb_backlight.ops)
 		return -EINVAL;
 
@@ -1289,68 +1275,53 @@ static ssize_t clevo_xsm_rgb_show(struct device *child,
 {
 	if (kb_backlight.extra == KB_HAS_EXTRA_TRUE)
 		return sprintf(buf, "%08x %08x %08x %08x\n",
-			kb_backlight.rgbcolor.left,
-			kb_backlight.rgbcolor.center,
-			kb_backlight.rgbcolor.right,
-			kb_backlight.rgbcolor.extra);
+			kb_backlight.rgbcolor[0],
+			kb_backlight.rgbcolor[1],
+			kb_backlight.rgbcolor[2],
+			kb_backlight.rgbcolor[3]);
 	else
 		return sprintf(buf, "%08x %08x %08x\n",
-			kb_backlight.rgbcolor.left,
-			kb_backlight.rgbcolor.center,
-			kb_backlight.rgbcolor.right);
+			kb_backlight.rgbcolor[0],
+			kb_backlight.rgbcolor[1],
+			kb_backlight.rgbcolor[2]);
 }
 
 static ssize_t clevo_xsm_rgb_store(struct device *child,
 	struct device_attribute *attr, const char *buf, size_t size)
 {
-	unsigned int i, j;
+	unsigned int i;
+    uint32_t colors[4] = { 0, 0, 0, 0 };
 
 	if (!kb_backlight.ops)
 		return -EINVAL;
 
-    int left = 0, center = 0, right = 0, extra = 0;
-    i = sscanf(buf, "%x %x %x %x", &left, &center, &right, &extra );
-    if( i == 3 || i == 4 )
+    //Support Binary-mode 
+    if( size == 12 || size == 16 )
     {
-        kb_backlight.ops->set_rgb( left, center, right, extra );
+        colors[0] = ((uint32_t*)buf)[0];
+        colors[1] = ((uint32_t*)buf)[1];
+        colors[2] = ((uint32_t*)buf)[2];
+        if( size == 16 )
+            colors[3] = ((uint32_t*)buf)[3];
+    }
+    else //Allow hex-input.
+    {
+        i = sscanf(buf, "%x %x %x %x", &colors[0], &colors[1], &colors[2], &colors[3] );
+        if( i != 3 && i != 4 )
+        {
+            return -EINVAL;
+        } 
+    }
 
+    if( kb_backlight.ops->set_rgb )
+    {
+        kb_backlight.ops->set_rgb( colors );
     }
     else
     {
         return -EINVAL;
-    } 
-/*
-	i = sscanf(buf, "%7s %7s %7s %7s", left, center, right, extra);
+    }
 
-	if (i == 1) {
-		for (j = 0; j < ARRAY_SIZE(kb_colors); j++) {
-			if (!strcmp(left, kb_colors[j].name))
-				val[0] = j;
-		}
-		val[0] = clamp_t(unsigned, val[0], 0, ARRAY_SIZE(kb_colors));
-		val[3] = val[2] = val[1] = val[0];
-
-	} else if (i == 3 || i == 4) {
-		for (j = 0; j < ARRAY_SIZE(kb_colors); j++) {
-			if (!strcmp(left, kb_colors[j].name))
-				val[0] = j;
-			if (!strcmp(center, kb_colors[j].name))
-				val[1] = j;
-			if (!strcmp(right, kb_colors[j].name))
-				val[2] = j;
-			if (!strcmp(extra, kb_colors[j].name))
-				val[3] = j;
-		}
-		val[0] = clamp_t(unsigned, val[0], 0, ARRAY_SIZE(kb_colors));
-		val[1] = clamp_t(unsigned, val[1], 0, ARRAY_SIZE(kb_colors));
-		val[2] = clamp_t(unsigned, val[2], 0, ARRAY_SIZE(kb_colors));
-		val[3] = clamp_t(unsigned, val[3], 0, ARRAY_SIZE(kb_colors));
-
-	} else
-		return -EINVAL;
-
-	kb_backlight.ops->set_color(val[0], val[1], val[2], val[3]);
-*/
 	return size;
 }
 static DEVICE_ATTR(kb_rgb, 0644,
