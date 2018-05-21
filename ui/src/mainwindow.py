@@ -7,7 +7,7 @@ import logging
 import os
 import sys
 
-import tkinter as tk
+import Tkinter as tk
 
 from utils.staticvalues import PROGRAM_NAME
 from utils.helper import get_file_uri, is_user_root, create_modprobe_file
